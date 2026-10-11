@@ -38,6 +38,12 @@ typedef enum {
 /* USER CODE BEGIN PD */
 #define RX_Tamaño_Buffer 32
 #define RX_TIMEOUT_MS 30
+
+#define I2C_DEV_ADDRESS 0x25 // Misma dirección que el ESP32 (7 bits)
+#define I2C_ADDR_ESP32 (I2C_DEV_ADDRESS << 1)
+#define I2C_CMD_MEDIR 'M' // Comando de "solicitar medición"
+#define I2C_RESP_SIZE 3 // Bytes de respuesta del ESP32
+#define I2C_TIMEOUT_MS 100 // Espera máxima por transacción
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,7 +52,11 @@ typedef enum {
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
 SPI_HandleTypeDef hspi2;
+
+TIM_HandleTypeDef htim6;
 
 UART_HandleTypeDef huart2;
 
@@ -60,6 +70,7 @@ volatile uint8_t lineaEnviada = 0; // Si es igual a uno, indica que el usuario p
 Estado_t estado = ESTADO_MENU; // Estado actual del sistema
 volatile uint32_t ultimoRx = 0; // Instante en ms en que llegó el último byte
 
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,6 +78,8 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
 // Prototipos de funciones
 void contenidoUart(const char *s);
@@ -75,6 +88,10 @@ void mostrarSubmenuSPI(void);
 void procesarLinea(void);
 uint8_t validarComandoSPI(const char *linea, uint8_t *led, uint16_t *tiempo);
 void enviarComandoSPI(uint8_t led, uint16_t tiempo);
+
+void solicitarMedicionI2C();
+void actualizarSignal (uint16_t tiempo);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -113,6 +130,8 @@ int main(void)
   MX_GPIO_Init();
   MX_SPI2_Init();
   MX_USART2_UART_Init();
+  MX_I2C1_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
 
   // TxData = 25;
@@ -129,6 +148,7 @@ int main(void)
   //*************************************************************************/
   // Recepción usando ISR
   HAL_UART_Receive_IT(&huart2, &rxByte, 1); // Arma la recepción de la interrupción
+
   mostrarMenu(); // Muestra una vez al inicio del programa las opciones del menú
   /* USER CODE END 2 */
 
@@ -136,27 +156,6 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-
-//	  TxData = 1;
-//
-//	  // Activamos slave
-//	  HAL_GPIO_WritePin(ESP32_CS_GPIO_Port, ESP32_CS_Pin, GPIO_PIN_RESET);
-//	  HAL_SPI_TransmitReceive(&hspi2, &TxData, &RxData, 1, HAL_MAX_DELAY);
-//
-//	  // Desactivamos Slave
-//	  HAL_GPIO_WritePin(ESP32_CS_GPIO_Port, ESP32_CS_Pin, GPIO_PIN_SET);
-//	  HAL_Delay(500);
-//
-//	  TxData = 0;
-//
-//	  // Activamos slave
-//	  HAL_GPIO_WritePin(ESP32_CS_GPIO_Port, ESP32_CS_Pin, GPIO_PIN_RESET);
-//	  HAL_SPI_TransmitReceive(&hspi2, &TxData, &RxData, 1, HAL_MAX_DELAY);
-//
-//	  // Desactivamos Slave
-//	  HAL_GPIO_WritePin(ESP32_CS_GPIO_Port, ESP32_CS_Pin, GPIO_PIN_SET);
-//	  HAL_Delay(500);
-
 	  //*************************************************************************/
 	  // Inicio programación proyecto
 	  //*************************************************************************/
@@ -201,9 +200,9 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 16;
-  RCC_OscInitStruct.PLL.PLLN = 336;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 96;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 2;
   RCC_OscInitStruct.PLL.PLLR = 2;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
@@ -217,13 +216,47 @@ void SystemClock_Config(void)
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
 }
 
 /**
@@ -261,6 +294,44 @@ static void MX_SPI2_Init(void)
   /* USER CODE BEGIN SPI2_Init 2 */
 
   /* USER CODE END SPI2_Init 2 */
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 48000-1;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 65535;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
 
 }
 
@@ -319,7 +390,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(ESP32_CS_GPIO_Port, ESP32_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LD2_Pin|LD1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -334,12 +405,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(ESP32_CS_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : LD2_Pin */
-  GPIO_InitStruct.Pin = LD2_Pin;
+  /*Configure GPIO pins : LD2_Pin LD1_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin|LD1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -410,8 +481,8 @@ void procesarLinea(void) {
 			}
 
 			else if (strcmp(rxLinea, "2") == 0) {
-				contenidoUart("\r\nOpcion no implementada (por el momento)\r\n");
-				mostrarMenu();
+				solicitarMedicionI2C(); // Pide medición de ESP32 y la imprime a la terminal.
+				mostrarMenu(); // Una vez obtenida la medición, se regresa al menú.
 
 			}
 			else {
@@ -430,12 +501,12 @@ void procesarLinea(void) {
 
 				enviarComandoSPI(led, tiempo);
 
+				actualizarSignal(tiempo);
+
 				char mensaje[64];
 				snprintf(mensaje, sizeof(mensaje), "\r\nEnviado por SPI: LED %u, %u ms", (unsigned)led, (unsigned)tiempo);
 
 				contenidoUart(mensaje);
-
-				// TODO parte 5: aquí se actualizará el periodo del timer con 'tiempo'
 
 				estado = ESTADO_MENU;
 				mostrarMenu();
@@ -486,6 +557,59 @@ void enviarComandoSPI(uint8_t led, uint16_t tiempo) {
 
 }
 
+void solicitarMedicionI2C() {
+
+	uint8_t cmd = I2C_CMD_MEDIR;
+	uint8_t rx[I2C_RESP_SIZE] = {0};
+
+	// Se envía la solicitud al ESP32 (1 byte)
+	HAL_StatusTypeDef estadoI2C = HAL_I2C_Master_Transmit(&hi2c1, I2C_ADDR_ESP32, &cmd, 1, I2C_TIMEOUT_MS);
+
+	// Si la solicitud llegó, se lee la respuesta
+	if (estadoI2C == HAL_OK) {
+		estadoI2C = HAL_I2C_Master_Receive(&hi2c1, I2C_ADDR_ESP32, rx, I2C_RESP_SIZE, I2C_TIMEOUT_MS);
+	}
+
+	// Si algó falló, se imprime un mensaje en la terminal y se reinicia el periférico
+	if (estadoI2C != HAL_OK) {
+		contenidoUart("\r\nError: El ESP32 no responde por I2C.\r\n");
+		HAL_I2C_DeInit(&hi2c1);
+		MX_I2C1_Init();
+		return;
+	}
+
+	// Se contruyen los datos
+	uint8_t valor8 = rx[0];
+	uint16_t milivoltios = ((uint16_t)rx[1] << 8) | rx[2];
+
+	// Se imprime en la terminal
+	char mensaje[90];
+	snprintf(mensaje, sizeof(mensaje), "\r\nPotenciometro 1: %u.%02u V\r\nValor ADC: %u (0 - 255)\r\n",
+			(unsigned)(milivoltios)/1000,
+			(unsigned)((milivoltios % 1000) / 10),
+			(unsigned)valor8);
+	contenidoUart(mensaje);
+
+
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+	if (htim == &htim6) {
+		HAL_GPIO_TogglePin(LD1_GPIO_Port, LD1_Pin);
+	}
+}
+
+void actualizarSignal (uint16_t tiempo) {
+	static uint8_t  timerActivo = 0;
+
+	__HAL_TIM_SET_AUTORELOAD(&htim6, tiempo -1);
+	__HAL_TIM_SET_COUNTER(&htim6, 0);
+
+	if (!timerActivo) {
+		HAL_TIM_Base_Start_IT(&htim6);
+		timerActivo = 1;
+	}
+}
 
 /* USER CODE END 4 */
 
